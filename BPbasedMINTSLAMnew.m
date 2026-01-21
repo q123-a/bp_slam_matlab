@@ -11,8 +11,10 @@
 %   estimatedAnchors             - 估计的锚点位置和存在概率
 %   posteriorParticlesAnchorsstorage - 存储部分时刻锚点粒子用于分析
 %   numEstimatedAnchors          - 每时刻估计的锚点数量
+%   historyParticles             - 历史粒子集合（用于后向平滑）
+%   historyWeights               - 历史权重集合（用于后向平滑）
 
-function [ estimatedTrajectory, estimatedAnchors, posteriorParticlesAnchorsstorage, numEstimatedAnchors ] =  BPbasedMINTSLAMnew( dataVA, clutteredMeasurements, parameters, trueTrajectory )
+function [ estimatedTrajectory, estimatedAnchors, posteriorParticlesAnchorsstorage, numEstimatedAnchors, historyParticles, historyWeights ] =  BPbasedMINTSLAMnew( dataVA, clutteredMeasurements, parameters, trueTrajectory )
 
 % 获取测量时间步数和传感器数量
 [numSteps,numSensors] = size(clutteredMeasurements);
@@ -36,7 +38,15 @@ load scen_semroom_new; % 加载场景（如果需要）
 estimatedTrajectory = zeros(4,numSteps); % 状态空间4维：x,y,vx,vy
 numEstimatedAnchors = zeros(2,numSteps); % 记录两个传感器各自锚点数量
 storing_idx = 30:30:numSteps;            % 每30步存储一次锚点粒子状态
+% 确保最后一步总是被保存（用于地图先验）
+if ~any(storing_idx == numSteps)
+    storing_idx = [storing_idx, numSteps];
+end
 posteriorParticlesAnchorsstorage = cell(1,length(storing_idx));
+
+% 初始化历史存储（用于后向平滑）
+historyParticles = cell(numSteps, 1);
+historyWeights = cell(numSteps, 1);
 
 % 初始化移动体粒子
 if(known_track)
@@ -50,8 +60,22 @@ end
 % 记录初始状态估计（粒子均值）
 estimatedTrajectory(:,1) = mean(posteriorParticlesAgent,2);
 
+% 保存第0步的初始状态（用于后向平滑）
+initWeights = ones(numParticles, 1) / numParticles;
+historyParticles{1} = posteriorParticlesAgent;
+historyWeights{1} = initWeights;
+
 % 初始化锚点状态（位置粒子和权重）
-[ estimatedAnchors, posteriorParticlesAnchors ] =  initAnchors( parameters, dataVA, numSteps, numSensors );
+% 检查是否有先验地图
+if isfield(parameters, 'priorMap') && ~isempty(parameters.priorMap)
+    % 使用先验地图初始化（Round 2）
+    [ estimatedAnchors, posteriorParticlesAnchors ] = ...
+        initAnchorsWithPrior(parameters, dataVA, numSteps, numSensors, parameters.priorMap);
+else
+    % 标准初始化（Round 1）
+    [ estimatedAnchors, posteriorParticlesAnchors ] = ...
+        initAnchors(parameters, dataVA, numSteps, numSensors);
+end
 for sensor = 1:numSensors
   numEstimatedAnchors(sensor, 1) = size(estimatedAnchors{sensor,1},2);
 end
@@ -67,6 +91,48 @@ for step = 2:numSteps
   else
     % 未知轨迹时，基于动力学模型预测粒子状态
     predictedParticlesAgent = performPrediction( posteriorParticlesAgent, parameters );
+
+    % 如果存在先验轨迹，则融合先验信息
+    if isfield(parameters, 'priorTrajectory') && ~isempty(parameters.priorTrajectory)
+      priorWeight = 0.3; % 默认先验权重
+      if isfield(parameters, 'priorWeight')
+        priorWeight = parameters.priorWeight;
+      end
+
+      % 从先验轨迹中提取当前时刻的状态
+      priorState = parameters.priorTrajectory(:, step);
+
+      % ===== 关键改进：避免"数据乱伦"和"粒子坍缩" =====
+      % 问题1：数据乱伦 - 先验轨迹来自Round 1的测量Z，Round 2又用Z更新
+      % 问题2：粒子坍缩 - 所有粒子被拉向同一点，失去多样性
+      %
+      % 解决方案：添加额外噪声（1.5倍标准噪声）保持粒子活性
+
+      % 噪声放大因子（防止过拟合）
+      noiseFactor = 1.5;
+
+      % 获取运动模型的转移矩阵
+      [A_prior, W_prior] = getTransitionMatrices(parameters.scanTime);
+
+      % 计算过程噪声标准差
+      processNoiseStd = sqrt(parameters.drivingNoiseVariance);
+
+      for p = 1:numParticles
+        % 1. 计算融合均值
+        meanPos = (1 - priorWeight) * predictedParticlesAgent(:, p) + priorWeight * priorState;
+
+        % 2. 生成额外噪声（在加速度空间，保持物理一致性）
+        accelNoise = noiseFactor * processNoiseStd * randn(2, 1);
+        stateNoise = W_prior * accelNoise;
+
+        % 3. 最终粒子 = 融合均值 + 额外噪声
+        predictedParticlesAgent(:, p) = meanPos + stateNoise;
+      end
+
+      if step == 2
+        fprintf('  [先验注入] 权重=%.2f, 噪声因子=%.2f (保持粒子多样性)\n', priorWeight, noiseFactor);
+      end
+    end
   end
 
   % 初始化存储每个粒子每个传感器权重的矩阵
@@ -161,7 +227,11 @@ for step = 2:numSteps
   weightsSensors = weightsSensors - max(weightsSensors);
   weightsSensors = exp(weightsSensors);
   weightsSensors = weightsSensors/sum(weightsSensors);
-  
+
+  % 保存当前时刻的粒子和权重（必须在重采样之前！）
+  historyParticles{step} = predictedParticlesAgent;
+  historyWeights{step} = weightsSensors;
+
   % 保存部分关键时间步的锚点粒子状态，用于分析
   if(any(storing_idx == step))
     posteriorParticlesAnchorsstorage{storing_idx == step} = posteriorParticlesAnchors;
