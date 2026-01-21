@@ -86,10 +86,56 @@ clutteredMeasurements = generateClutteredMeasurements(measurements, parameters);
 % ---------------------------
 % 7. 调用核心BP-SLAM算法进行估计
 % ---------------------------
-[estimatedTrajectory, estimatedAnchors, posteriorParticlesAnchors, numEstimatedAnchors] = ...
+[estimatedTrajectory, estimatedAnchors, posteriorParticlesAnchors, numEstimatedAnchors, historyParticles, historyWeights] = ...
     BPbasedMINTSLAMnew(dataVA, clutteredMeasurements, parameters, trueTrajectory);
+
+% ---------------------------
+% 7.5 执行后向粒子平滑（可选）
+% ---------------------------
+fprintf('\n========================================\n');
+fprintf('开始执行后向粒子平滑...\n');
+fprintf('========================================\n');
+
+% 调用平滑函数（默认使用10条轨迹）
+smoothedTrajectory = runBackwardSmoothing(historyParticles, historyWeights, parameters, 50);
+
+fprintf('平滑完成！\n\n');
 
 % ---------------------------
 % 8. 绘制结果（轨迹、锚点估计等）
 % ---------------------------
 plotAll(trueTrajectory, estimatedTrajectory, estimatedAnchors, posteriorParticlesAnchors{end}, numEstimatedAnchors, dataVA, parameters, 0, parameters.maxSteps);
+
+% ---------------------------
+% 9. 计算并比较滤波与平滑的误差
+% ---------------------------
+fprintf('\n========================================\n');
+fprintf('误差分析\n');
+fprintf('========================================\n');
+
+% 计算滤波误差
+filterErrors = sqrt(sum((trueTrajectory(1:2,:) - estimatedTrajectory(1:2,:)).^2, 1));
+filterRMSE = sqrt(mean(filterErrors.^2));
+
+% 计算平滑误差
+smoothErrors = sqrt(sum((trueTrajectory(1:2,:) - smoothedTrajectory(1:2,:)).^2, 1));
+smoothRMSE = sqrt(mean(smoothErrors.^2));
+
+% 打印结果
+fprintf('滤波 RMSE: %.6f m\n', filterRMSE);
+fprintf('平滑 RMSE: %.6f m\n', smoothRMSE);
+improvement = (filterRMSE - smoothRMSE) / filterRMSE * 100;
+if improvement > 0
+    fprintf('改善: %.2f%% ✓\n', improvement);
+else
+    fprintf('恶化: %.2f%% ✗\n', -improvement);
+end
+
+% ---------------------------
+% 10. 保存结果
+% ---------------------------
+fprintf('\n保存结果到 results_matlab.mat...\n');
+save('results_matlab.mat', 'trueTrajectory', 'estimatedTrajectory', ...
+     'smoothedTrajectory', 'filterErrors', 'smoothErrors', ...
+     'filterRMSE', 'smoothRMSE', 'parameters');
+fprintf('结果已保存！\n');
